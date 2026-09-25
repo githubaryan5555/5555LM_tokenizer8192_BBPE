@@ -57,13 +57,13 @@ TRAIN_RATIO = 0.90
 # 4 MB or 8 MB is usually faster for large datasets.
 #
 # It does NOT mean the entire dataset is loaded into RAM.
-CHUNK_SIZE = 4 * 1024 * 1024
+CHUNK_SIZE = 1034 * 1024 * 1024
 
 
 # Number of token IDs accumulated before writing them.
 #
 # 1 million uint16 tokens = ~2 MB.
-TOKEN_BUFFER_SIZE = 1_000_000
+TOKEN_BUFFER_SIZE = 10_000_000
 
 
 # ============================================================
