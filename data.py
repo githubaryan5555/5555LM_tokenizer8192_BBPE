@@ -9,7 +9,7 @@ dataset = load_dataset(
     streaming=True
 )
 
-target_size_bytes = 20 * 1024 * 1024  # 20 MB
+target_size_bytes = 2000 * 1024 * 1024  # 20 MB
 current_size_bytes = 0
 collected_texts = []
 
