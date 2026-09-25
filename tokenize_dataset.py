@@ -23,7 +23,7 @@ Features:
 """
 
 import json
-import struct
+from array import array
 from pathlib import Path
 
 from tokenizers import Tokenizer
@@ -44,26 +44,11 @@ VAL_FILE = OUTPUT_DIR / "val.bin"
 
 DATASET_CONFIG_FILE = OUTPUT_DIR / "dataset_config.json"
 
-
-# Train / validation split.
 TRAIN_RATIO = 0.90
 
+CHUNK_SIZE = 8 * 1024 * 1024
 
-# Size of each raw-data chunk read from disk.
-#
-# This controls RAM usage.
-#
-# 1 MB is conservative.
-# 4 MB or 8 MB is usually faster for large datasets.
-#
-# It does NOT mean the entire dataset is loaded into RAM.
-CHUNK_SIZE = 1034 * 1024 * 1024
-
-
-# Number of token IDs accumulated before writing them.
-#
-# 1 million uint16 tokens = ~2 MB.
-TOKEN_BUFFER_SIZE = 10_000_000
+TOKEN_BUFFER_SIZE = 1_000_000
 
 
 # ============================================================
@@ -71,17 +56,8 @@ TOKEN_BUFFER_SIZE = 10_000_000
 # ============================================================
 
 def validate_configuration(tokenizer):
-    """
-    Make sure uint16 is safe for this tokenizer.
-    """
-
     vocab_size = tokenizer.get_vocab_size()
 
-    # uint16 supports:
-    #
-    # 0 ... 65535
-    #
-    # Therefore vocab_size must be <= 65536.
     if vocab_size > 65536:
         raise ValueError(
             f"Vocabulary size is {vocab_size:,}, "
@@ -98,16 +74,6 @@ def validate_configuration(tokenizer):
 # ============================================================
 
 def find_split_position():
-    """
-    Find a split close to 90% of the raw file.
-
-    The split is moved forward to the next newline so that
-    we don't cut a text line in half.
-
-    Returns:
-        split_position in bytes
-    """
-
     print()
     print("=" * 70)
     print("FINDING TRAIN / VALIDATION SPLIT")
@@ -125,11 +91,7 @@ def find_split_position():
     )
 
     with open(RAW_DATA, "rb") as f:
-
-        # Jump directly to ~90%.
         f.seek(target_position)
-
-        # Move to the end of the current line.
         f.readline()
 
         split_position = f.tell()
@@ -138,11 +100,15 @@ def find_split_position():
     val_bytes = file_size - split_position
 
     print()
-    print(f"Actual train  : {train_bytes:,} bytes "
-          f"({train_bytes / file_size * 100:.2f}%)")
+    print(
+        f"Actual train  : {train_bytes:,} bytes "
+        f"({train_bytes / file_size * 100:.2f}%)"
+    )
 
-    print(f"Actual val    : {val_bytes:,} bytes "
-          f"({val_bytes / file_size * 100:.2f}%)")
+    print(
+        f"Actual val    : {val_bytes:,} bytes "
+        f"({val_bytes / file_size * 100:.2f}%)"
+    )
 
     return split_position
 
@@ -152,69 +118,33 @@ def find_split_position():
 # ============================================================
 
 class TokenWriter:
-    """
-    Buffered uint16 token writer.
-
-    Instead of calling write() once for every token, tokens are
-    accumulated in memory and written in batches.
-
-    This is substantially faster for large datasets.
-    """
 
     def __init__(self, path):
         self.path = path
-
         self.file = open(path, "wb")
 
-        self.buffer = []
+        self.buffer = array("H")
 
         self.total_tokens = 0
 
     def add(self, token_ids):
-        """
-        Add token IDs to the buffer.
-        """
-
         self.buffer.extend(token_ids)
 
         if len(self.buffer) >= TOKEN_BUFFER_SIZE:
             self.flush()
 
     def flush(self):
-        """
-        Write buffered token IDs as little-endian uint16.
-        """
-
         if not self.buffer:
             return
 
-        # '<' = little endian
-        # 'H' = unsigned short = uint16
-        #
-        # Example:
-        #
-        # token IDs:
-        # [10, 20, 300]
-        #
-        # become 6 bytes on disk.
-        data = struct.pack(
-            f"<{len(self.buffer)}H",
-            *self.buffer
-        )
-
-        self.file.write(data)
+        self.file.write(self.buffer.tobytes())
 
         self.total_tokens += len(self.buffer)
 
         self.buffer.clear()
 
     def close(self):
-        """
-        Flush remaining tokens and close the file.
-        """
-
         self.flush()
-
         self.file.close()
 
 
@@ -229,34 +159,10 @@ def tokenize_range(
     output_file,
     label,
 ):
-    """
-    Stream a byte range of RAW_DATA through the tokenizer.
-
-    Only a small chunk of the raw dataset is held in memory.
-
-    Args:
-        tokenizer:
-            Hugging Face tokenizers.Tokenizer
-
-        start:
-            Starting byte offset.
-
-        end:
-            Ending byte offset.
-
-        output_file:
-            Destination .bin file.
-
-        label:
-            Human-readable name for progress output.
-    """
-
     writer = TokenWriter(output_file)
 
     processed_bytes = 0
 
-    # UTF-8 bytes that belong to a character which was split
-    # across two chunks.
     leftover = b""
 
     with open(RAW_DATA, "rb") as src:
@@ -276,44 +182,26 @@ def tokenize_range(
 
             processed_bytes += len(data)
 
-            # Combine bytes left over from the previous chunk.
             if leftover:
                 data = leftover + data
                 leftover = b""
 
-            # ------------------------------------------------
-            # UTF-8 SAFE DECODING
-            # ------------------------------------------------
-
             try:
-
                 text = data.decode("utf-8")
 
             except UnicodeDecodeError as error:
 
-                # The error may be caused by an incomplete UTF-8
-                # character at the end of the chunk.
-                #
-                # Everything before error.start is valid.
                 valid_data = data[:error.start]
 
                 leftover = data[error.start:]
 
                 text = valid_data.decode("utf-8")
 
-            # ------------------------------------------------
-            # TOKENIZE
-            # ------------------------------------------------
-
             if text:
 
                 encoding = tokenizer.encode(text)
 
                 writer.add(encoding.ids)
-
-            # ------------------------------------------------
-            # PROGRESS
-            # ------------------------------------------------
 
             if processed_bytes % (256 * 1024 * 1024) < CHUNK_SIZE:
 
@@ -331,10 +219,6 @@ def tokenize_range(
                     flush=True,
                 )
 
-    # ========================================================
-    # FINAL UTF-8 LEFTOVER
-    # ========================================================
-
     if leftover:
 
         text = leftover.decode("utf-8")
@@ -345,7 +229,6 @@ def tokenize_range(
 
             writer.add(encoding.ids)
 
-    # Write remaining buffered tokens.
     writer.close()
 
     print()
@@ -358,10 +241,6 @@ def tokenize_range(
 # ============================================================
 
 def file_size_mb(path):
-    """
-    Return file size in MiB.
-    """
-
     return path.stat().st_size / (1024 * 1024)
 
 
@@ -387,7 +266,6 @@ def main():
             f"    {TOKENIZER_FILE.resolve()}"
         )
 
-    # Create output directory.
     OUTPUT_DIR.mkdir(
         parents=True,
         exist_ok=True,
@@ -407,7 +285,10 @@ def main():
     print(f"Output dir     : {OUTPUT_DIR}")
     print(f"Train ratio    : {TRAIN_RATIO:.2f}")
     print(f"Val ratio      : {1.0 - TRAIN_RATIO:.2f}")
-    print(f"Chunk size     : {CHUNK_SIZE / 1024 / 1024:.1f} MiB")
+    print(
+        f"Chunk size     : "
+        f"{CHUNK_SIZE / 1024 / 1024:.1f} MiB"
+    )
     print(
         f"Token buffer   : "
         f"{TOKEN_BUFFER_SIZE:,} tokens"
